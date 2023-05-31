@@ -1,0 +1,194 @@
+Parameters:
+  ArtifactBucketName:
+    Type: String
+    Description: Name of the S3 bucket containing all the lambda function artifacts
+    Default: etl-artifacts-gz
+  ETLBucketName:
+    Type: String
+    Description: Name of the S3 bucket containing all the data
+    Default: etl-pipeline-1234
+  ETLPrefix:
+    Type: String
+    Description: Name of the toplevel folder to keep the loaded data
+    Default: prod-data
+  RawPrefix:
+    Type: String
+    Description: Name of the toplevel folder to keep the raw data
+    Default: raw-data
+  BackupPrefix:
+    Type: String
+    Description: Name of the toplevel folder to keep the backed up data
+    Default: backup-data/
+  AppZipFileName:
+    Type: String
+    Description: Name of the zip file containing the entire application
+    Default: app.zip
+  RequestsLibName:
+    Type: String
+    Description: Name of the zip file containing the entire application
+    Default: requests-layer.zip
+  GlueDatabaseName:
+    Type: String
+    Description: Name of the glue database where ETL data loads into
+    Default: etldb
+  GlueTableName:
+    Type: String
+    Description: Name of the table for the ETL data
+    Default: etltable
+
+Resources:
+  ETLBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ETLBucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Sub "${RawPrefix}/"
+                  - Name: suffix
+                    Value: .csv
+            Function: !GetAtt ProcessLambda.Arn
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+
+  ExtractLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: extract
+      MemorySize: 1024
+      Timeout: 30
+      Runtime: python3.9
+      Handler: lambda_function.extract
+      Role: !GetAtt ExtractLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref ArtifactBucketName
+        S3Key: !Ref AppZipFileName
+      Environment:
+        Variables:
+          S3_BACKUP_PREFIX: !Ref BackupPrefix
+          S3_BUCKET: !Ref ETLBucketName
+          S3_EXTRACT_PREFIX: !Ref RawPrefix
+      Layers:
+        - !Ref RequestsLayer
+
+  ExtractLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ExtractLambdaRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ExtractLambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${ETLBucketName}/*"
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*:*"
+
+  ProcessLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: transformLoad
+      Runtime: python3.9
+      MemorySize: 3008
+      Timeout: 120
+      Handler: lambda_function.transform
+      Role: !GetAtt ProcessLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref ArtifactBucketName
+        S3Key: !Ref AppZipFileName
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref ETLBucketName
+          S3_PREFIX: !Ref ETLPrefix
+          GLUE_DATABASE: !Ref GlueDatabaseName
+          GLUE_TABLE: !Ref GlueTableName
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python39:7"
+
+  ProcessLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ProcessLambdaRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ProcessLambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject*
+                - s3:List*
+                Resource:
+                - !Sub "arn:aws:s3:::${ETLBucketName}"
+                - !Sub "arn:aws:s3:::${ETLBucketName}/*"
+              - Effect: Allow
+                Sid: GlueDBAccess
+                Action:
+                  - glue:*Table*
+                  - glue:*Partition*
+                Resource:
+                - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}"
+                - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/${GlueTableName}"
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*:*"
+
+  RequestsLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.7
+        - python3.8
+        - python3.9
+      Content:
+        S3Bucket: !Ref ArtifactBucketName
+        S3Key: !Ref RequestsLibName
+      Description: Contains requests lib along with urllib3 <2
+      LayerName: requests-layer
+
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProcessLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::${ETLBucketName}

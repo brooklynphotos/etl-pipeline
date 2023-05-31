@@ -1,0 +1,6 @@
+-r ../requirements.txt
+pytest-cov
+black
+pylint
+cfn-lint
+moto
